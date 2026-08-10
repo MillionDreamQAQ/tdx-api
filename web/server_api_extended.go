@@ -298,7 +298,7 @@ func handleGetIndexAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	limit := parsePositiveInt(r.URL.Query().Get("limit"))
-	list, err := fetchIndexAll(code, klineType)
+	list, err := fetchIndexAll(code, klineType, limit)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("获取指数历史数据失败: %v", err))
 		return
@@ -756,14 +756,10 @@ func handleGetKlineAllTDX(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := parsePositiveInt(r.URL.Query().Get("limit"))
 
-	list, err := fetchStockKlineAllTDX(code, klineType)
+	list, err := fetchStockKlineTDX(code, klineType, limit)
 	if err != nil {
 		errorResponse(w, fmt.Sprintf("获取K线失败: %v", err))
 		return
-	}
-
-	if limit > 0 && len(list) > limit {
-		list = list[len(list)-limit:]
 	}
 
 	respondKlineSuccess(w, "tdx", klineType, list)
@@ -1151,71 +1147,134 @@ func parseBool(value string) bool {
 	}
 }
 
-func fetchStockKlineAllTDX(code, klineType string) ([]*protocol.Kline, error) {
+const tdxKlineBatchSize = 800
+
+// fetchRecentKline 只请求最近 limit 条K线。TDX返回的每一页按时间正序排列，
+// 但 start=0代表最新一页，因此多页结果需要从旧页到新页重新拼接。
+func fetchRecentKline(limit int, fetch func(start, count uint16) (*protocol.KlineResp, error)) ([]*protocol.Kline, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("limit must be positive")
+	}
+
+	pages := make([][]*protocol.Kline, 0)
+	total := 0
+	start := 0
+	lastPageHasContext := false
+	for total < limit {
+		if start > int(^uint16(0)) {
+			return nil, fmt.Errorf("请求数量超过TDX接口支持范围: %d", limit)
+		}
+
+		desiredCount := tdxKlineBatchSize
+		if remaining := limit - total; remaining < desiredCount {
+			desiredCount = remaining
+		}
+		requestCount := desiredCount
+		needsContext := desiredCount < tdxKlineBatchSize
+		if needsContext {
+			requestCount++
+		}
+
+		resp, err := fetch(uint16(start), uint16(requestCount))
+
+		if err != nil {
+			return nil, err
+		}
+		if resp == nil {
+			return nil, fmt.Errorf("TDX返回空K线响应")
+		}
+		if len(resp.List) == 0 {
+			break
+		}
+		page := resp.List
+		lastPageHasContext = needsContext && len(page) > desiredCount
+		if lastPageHasContext {
+			page = page[1:]
+		}
+		if len(page) > desiredCount {
+			page = page[len(page)-desiredCount:]
+		}
+		if len(page) == 0 {
+			break
+		}
+
+		// 当前页比上一页更旧，修复上一页第一根K线的昨日收盘价。
+		// 这是 GetKlineUntil/GetIndexUntil 跨页拼接时已有的行为。
+		if len(pages) > 0 && len(pages[len(pages)-1]) > 0 {
+			pages[len(pages)-1][0].Last = page[len(page)-1].Close
+		}
+		pages = append(pages, page)
+		total += len(page)
+
+		if len(page) < desiredCount {
+			break
+		}
+		start += desiredCount
+	}
+
+	result := make([]*protocol.Kline, 0, total)
+	for i := len(pages) - 1; i >= 0; i-- {
+		result = append(result, pages[i]...)
+	}
+	if len(result) > limit {
+		result = result[len(result)-limit:]
+	}
+	if len(result) == limit && !lastPageHasContext && limit <= int(^uint16(0)) {
+		// 有限请求的第一根K线可能是底层响应的首条记录，缺少前一根
+		// K线的收盘价。补取一条更旧数据，保持与“全量后截取”一致。
+		if previous, err := fetch(uint16(limit), 1); err != nil {
+			return nil, err
+		} else if previous != nil && len(previous.List) > 0 {
+			result[0].Last = previous.List[len(previous.List)-1].Close
+		}
+	}
+	return result, nil
+}
+
+func parseTDXKlineType(klineType string) (uint8, error) {
 	switch strings.ToLower(klineType) {
 	case "minute1":
-		resp, err := client.GetKlineMinuteAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKlineMinute, nil
 	case "minute5":
-		resp, err := client.GetKline5MinuteAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKline5Minute, nil
 	case "minute15":
-		resp, err := client.GetKline15MinuteAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKline15Minute, nil
 	case "minute30":
-		resp, err := client.GetKline30MinuteAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKline30Minute, nil
 	case "hour":
-		resp, err := client.GetKlineHourAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKline60Minute, nil
 	case "day":
-		resp, err := client.GetKlineDayAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKlineDay, nil
 	case "week":
-		resp, err := client.GetKlineWeekAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKlineWeek, nil
 	case "month":
-		resp, err := client.GetKlineMonthAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKlineMonth, nil
 	case "quarter":
-		resp, err := client.GetKlineQuarterAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
+		return protocol.TypeKlineQuarter, nil
 	case "year":
-		resp, err := client.GetKlineYearAll(code)
+		return protocol.TypeKlineYear, nil
+	default:
+		return 0, fmt.Errorf("不支持的K线类型: %s", klineType)
+	}
+}
+
+func fetchStockKlineTDX(code, klineType string, limit int) ([]*protocol.Kline, error) {
+	typeCode, err := parseTDXKlineType(klineType)
+	if err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		resp, err := client.GetKlineAll(typeCode, code)
 		if err != nil {
 			return nil, err
 		}
 		return resp.List, nil
-	default:
-		return nil, fmt.Errorf("不支持的K线类型: %s", klineType)
 	}
+
+	return fetchRecentKline(limit, func(start, count uint16) (*protocol.KlineResp, error) {
+		return client.GetKline(typeCode, code, start, count)
+	})
 }
 
 func fetchStockKlineAllTHS(code, klineType string) ([]*protocol.Kline, error) {
@@ -1245,10 +1304,10 @@ func respondKlineSuccess(w http.ResponseWriter, source, klineType string, list [
 
 	switch source {
 	case "tdx":
-		meta["batch_limit"] = 800
+		meta["batch_limit"] = tdxKlineBatchSize
 		meta["notes"] = []string{
-			"通达信单次底层请求最多返回 800 条数据，服务端已顺序拼接全量结果",
-			"对于上市时间较长的标的，请预估调用耗时（通常 1-5 秒），客户端可增加超时时间",
+			"通达信单次底层请求最多返回 800 条数据；limit>0时仅拉取最近limit条，limit>800时按800条分页拼接；limit<=0才读取全部历史",
+			"对于全量历史或较大的limit，请根据数据量设置客户端超时时间",
 		}
 	case "ths":
 		meta["batch_limit"] = len(list)
@@ -1267,69 +1326,21 @@ func respondKlineSuccess(w http.ResponseWriter, source, klineType string, list [
 	})
 }
 
-func fetchIndexAll(code, klineType string) ([]*protocol.Kline, error) {
-	switch strings.ToLower(klineType) {
-	case "minute1":
-		resp, err := client.GetIndexAll(protocol.TypeKlineMinute, code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "minute5":
-		resp, err := client.GetIndexAll(protocol.TypeKline5Minute, code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "minute15":
-		resp, err := client.GetIndexAll(protocol.TypeKline15Minute, code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "minute30":
-		resp, err := client.GetIndexAll(protocol.TypeKline30Minute, code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "hour":
-		resp, err := client.GetIndexAll(protocol.TypeKline60Minute, code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "week":
-		resp, err := client.GetIndexWeekAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "month":
-		resp, err := client.GetIndexMonthAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "quarter":
-		resp, err := client.GetIndexQuarterAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "year":
-		resp, err := client.GetIndexYearAll(code)
-		if err != nil {
-			return nil, err
-		}
-		return resp.List, nil
-	case "day":
-		fallthrough
-	default:
-		resp, err := client.GetIndexDayAll(code)
+func fetchIndexAll(code, klineType string, limit int) ([]*protocol.Kline, error) {
+	typeCode, err := parseTDXKlineType(klineType)
+	if err != nil {
+		return nil, err
+	}
+
+	if limit <= 0 {
+		resp, err := client.GetIndexAll(typeCode, code)
 		if err != nil {
 			return nil, err
 		}
 		return resp.List, nil
 	}
+
+	return fetchRecentKline(limit, func(start, count uint16) (*protocol.KlineResp, error) {
+		return client.GetIndex(typeCode, code, start, count)
+	})
 }
